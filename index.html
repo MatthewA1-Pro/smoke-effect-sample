@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>NOIR FLOW — Interactive Ink</title>
+<meta name="description" content="A real-time GPU ink simulation. Black ink dispersing through liquid on warm ivory. Drag to disturb it." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;1,300&family=Inter:wght@300;400;500&display=swap" rel="stylesheet" />
+<style>
+  :root{ --ivory:#F2F0E9; --ink:#090909; --charcoal:#191919; --graphite:#66645F; --hair:#D7D4CB; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;background:var(--ivory);color:var(--ink);overflow:hidden;-webkit-font-smoothing:antialiased}
+  body{font-family:"Inter",system-ui,sans-serif;font-weight:300}
+  canvas#fluid{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;cursor:crosshair}
+  .ui{position:fixed;inset:0;pointer-events:none;display:grid;grid-template-rows:auto 1fr auto;padding:clamp(18px,3vw,40px)}
+  .top,.bottom{display:flex;justify-content:space-between;align-items:flex-end;gap:16px}
+  .top{align-items:flex-start}
+  .label{font-size:11px;letter-spacing:.28em;text-transform:uppercase;color:var(--graphite);font-weight:400}
+  .brand{font-size:12px;letter-spacing:.42em;text-transform:uppercase;font-weight:500;color:var(--ink)}
+  h1{font-family:"Cormorant Garamond",Georgia,serif;font-weight:300;font-size:clamp(40px,6.5vw,96px);line-height:.92;letter-spacing:-.01em;text-transform:uppercase;color:var(--ink)}
+  h1 em{font-style:italic;font-weight:300}
+  .sub{margin-top:14px;max-width:34ch;font-size:clamp(13px,1.05vw,15px);line-height:1.55;color:var(--charcoal)}
+  .hint{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--graphite);text-align:right}
+  .hint kbd{font:inherit;border:1px solid var(--hair);border-radius:2px;padding:1px 5px;margin:0 2px}
+  .reveal{opacity:0;transform:translateY(14px);transition:opacity 1.4s cubic-bezier(.2,.7,.2,1),transform 1.4s cubic-bezier(.2,.7,.2,1)}
+  .ready .reveal{opacity:1;transform:none}
+  .ready .reveal:nth-child(2){transition-delay:.15s}
+  #fallback{display:none;position:fixed;inset:0;background:
+    radial-gradient(60% 18% at 30% 52%, rgba(9,9,9,.85), transparent 70%),
+    radial-gradient(40% 14% at 62% 46%, rgba(25,25,25,.6), transparent 70%),
+    radial-gradient(30% 12% at 85% 42%, rgba(60,58,55,.45), transparent 70%), var(--ivory)}
+  #fallback p{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:12px;letter-spacing:.2em;text-transform:uppercase;color:var(--graphite)}
+  @media (max-width:640px){.hint{display:none}.sub{max-width:28ch}}
+  @media (prefers-reduced-motion:reduce){.reveal{transition:none;opacity:1;transform:none}}
+</style>
+</head>
+<body>
+<canvas id="fluid" aria-label="Interactive black ink fluid simulation. Drag to disturb the ink."></canvas>
+<div id="fallback" aria-hidden="true"><p>WebGL2 unavailable — static composition</p></div>
+
+<div class="ui" aria-hidden="true">
+  <div class="top">
+    <div class="brand reveal">Noir Flow</div>
+    <div class="label reveal">Experiment 001 — Interactive Fluid Study</div>
+  </div>
+  <div></div>
+  <div class="bottom">
+    <div>
+      <h1 class="reveal">Form follows<br/><em>feeling.</em></h1>
+      <p class="sub reveal">An interactive study of motion, material and digital expression. Move through the ink. Drag to tear it.</p>
+    </div>
+    <div class="hint reveal"><kbd>R</kbd> reset &nbsp; <kbd>Space</kbd> pause</div>
+  </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+// ───────────────────────────────────────────────────────────────────────────
+// NOIR FLOW — GPU stable-fluids ink (WebGL2 / GLSL ES 3.00)
+// Fields: velocity RG16F · dye RGBA16F (r dense ink, g veil, b grains) ·
+// pressure / divergence / curl R16F.  Per step: forcing (curl-noise + shear)
+// → curl → vorticity confinement → divergence → Jacobi pressure → projection
+// → advect velocity (semi-Lagrangian) → advect dye (MacCormack) → display.
+// Modelled on the reference: an ink band already spanning the frame, drifting
+// slowly leftwards, rolling up along its shear layer, with soft veils and
+// floating grains. Velocities are in simulation texels per second.
+// ───────────────────────────────────────────────────────────────────────────
+const canvas = document.getElementById('fluid');
+const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const CONFIG = {
+  simRes: 320,            // velocity / pressure grid height
+  dyeRes: 1080,           // ink grid height (capped to canvas height)
+  pressureIters: 32,
+  velDissipation: 0.30,   // 1/s
+  dyeDissipation: [0.015, 0.35, 0.08], // dense, veil, grains (1/s)
+  curl: 9,                // vorticity confinement
+  forceAmp: 4.5,          // curl-noise forcing (texels/s²)
+  drift: -2.4,            // leftward current inside ink (texels/s²)
+  splatRadius: 0.0018,
+  splatForce: 4200,
+  seed: 7,
+};
+
+const gl = canvas.getContext('webgl2', { alpha:false, antialias:false, depth:false, stencil:false, powerPreference:'high-performance' });
+if (!gl) return fallback('no-webgl2');
+if (!gl.getExtension('EXT_color_buffer_float')) return fallback('no-float-rt');
+const LINEAR_OK = !!(gl.getExtension('OES_texture_half_float_linear') || gl.getExtension('OES_texture_float_linear'));
+const FILTER = LINEAR_OK ? gl.LINEAR : gl.NEAREST;
+
+// ── Shaders ────────────────────────────────────────────────────────────────
+const VERT = `#version 300 es
+precision highp float;
+uniform vec2 texelSize;
+out vec2 vUv, vL, vR, vT, vB;
+void main(){
+  vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2));
+  vUv = p;
+  vL = vUv - vec2(texelSize.x,0.); vR = vUv + vec2(texelSize.x,0.);
+  vT = vUv + vec2(0.,texelSize.y); vB = vUv - vec2(0.,texelSize.y);
+  gl_Position = vec4(p*2.-1., 0., 1.);
+}`;
+const HEAD = `#version 300 es
+precision highp float; precision highp sampler2D;
+in vec2 vUv, vL, vR, vT, vB; out vec4 frag;`;
+const NOISE = `
+float hash21(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=hash21(i), b=hash21(i+vec2(1,0)), c=hash21(i+vec2(0,1)), d=hash21(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y); }
+float fbm(vec2 p){ float s=0., a=.5; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.03+vec2(17.1,9.3); a*=.5; } return s; }
+vec2 curlNoise(vec2 p, float e){
+  float n1=fbm(p+vec2(e,0)), n2=fbm(p-vec2(e,0)), n3=fbm(p+vec2(0,e)), n4=fbm(p-vec2(0,e));
+  return vec2(n3-n4, -(n1-n2))/(2.*e); }
+// centre line and half-width of the ink band as a function of x
+float bandY(float x, float seed){ return 0.50 + 0.075*sin(x*5.3 + seed) + 0.04*sin(x*11.7 + seed*2.3) + 0.03*sin(x*2.1 - seed); }
+float bandW(float x, float seed){ return 0.045 + 0.06*fbm(vec2(x*4.0, seed+7.0)); }`;
+
+// Initial state. mode 0 → dye, mode 1 → velocity.
+const F_INIT = HEAD + NOISE + `
+uniform float seed, aspect; uniform int mode;
+void main(){
+  vec2 p = vec2(vUv.x*aspect, vUv.y);
+  float yc = bandY(vUv.x, seed), w = bandW(vUv.x, seed);
+  float d = (vUv.y - yc)/w;
+  float core = exp(-d*d*1.5);
+  if (mode == 0){
+    float rope = exp(-d*d*3.0);                                            // narrow opaque core
+    float lumps = 0.25 + 1.1*smoothstep(0.30, 0.75, fbm(p*3.0 + seed));   // thick lumps / thin stretches
+    float ridges = pow(1.0 - abs(2.0*fbm(p*9.0 - seed*2.0) - 1.0), 3.0);  // thin sheets
+    float patches = smoothstep(0.42, 0.62, fbm(p*2.0 + seed*5.0));
+    float dense = rope*lumps*1.6 + ridges*exp(-d*d*0.5)*patches*0.45;
+    float veil = exp(-d*d*0.5) * pow(fbm(p*5.0 + seed*3.0), 2.0) * 0.35;
+    float g = step(0.9996, hash21(floor(p*640.0) + seed)) * exp(-d*d*0.25) * 3.0;
+    frag = vec4(dense, veil, g, 1.);
+  } else {
+    float side = clamp(d, -1., 1.);
+    vec2 v = vec2(-14.0 + side*20.0, 0.0) * exp(-d*d*0.35);        // shear layer + leftward drift
+    v += curlNoise(p*3.0 + seed, 0.01) * 9.0 * (0.25 + exp(-d*d*0.5));
+    frag = vec4(v, 0., 1.);
+  }
+}`;
+
+// Continuous gentle forcing so the ink keeps rolling without resetting.
+const F_FORCE = HEAD + NOISE + `
+uniform sampler2D uVelocity, uDye; uniform float dt, time, seed, aspect, amp, drift;
+void main(){
+  vec2 p = vec2(vUv.x*aspect, vUv.y);
+  vec4 d = texture(uDye, vUv);
+  float m = smoothstep(0.0, 0.5, d.r*1.5 + d.g);
+  vec2 cn  = curlNoise(p*2.2 + seed + vec2(time*0.025, -time*0.018), 0.01);
+  vec2 cn2 = curlNoise(p*6.5 - seed + vec2(-time*0.04, time*0.03), 0.01);
+  float side = clamp((vUv.y - bandY(vUv.x, seed))/bandW(vUv.x, seed), -1., 1.);
+  vec2 f = cn*amp*(0.2 + m) + cn2*amp*0.45*m + vec2(drift + side*1.2, 0.0)*m;
+  vec2 v = texture(uVelocity, vUv).xy + f*dt;
+  frag = vec4(v, 0., 1.);
+}`;
+
+const F_SPLAT = HEAD + `
+uniform sampler2D uTarget; uniform float aspect, radius; uniform vec3 color; uniform vec2 point;
+void main(){
+  vec2 p = vUv - point; p.x *= aspect;
+  frag = vec4(texture(uTarget, vUv).xyz + exp(-dot(p,p)/radius)*color, 1.);
+}`;
+
+const F_ADVECT = HEAD + `
+uniform sampler2D uVelocity, uSource; uniform vec2 texelSize, srcTexelSize; uniform float dt; uniform vec3 dissipation;
+#ifdef MANUAL
+vec4 bilerp(sampler2D s, vec2 uv, vec2 ts){
+  vec2 st = uv/ts - .5; vec2 i = floor(st); vec2 f = fract(st);
+  vec4 a = texture(s,(i+vec2(.5,.5))*ts), b = texture(s,(i+vec2(1.5,.5))*ts), c = texture(s,(i+vec2(.5,1.5))*ts), d = texture(s,(i+vec2(1.5,1.5))*ts);
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
+#define SAMPLE(s,uv,ts) bilerp(s,uv,ts)
+#else
+#define SAMPLE(s,uv,ts) texture(s,uv)
+#endif
+void main(){
+  vec2 coord = vUv - dt * SAMPLE(uVelocity, vUv, texelSize).xy * texelSize;
+  vec4 r = SAMPLE(uSource, coord, srcTexelSize);
+  frag = vec4(r.xyz / (1. + dt*dissipation), 1.);
+}`;
+
+// MacCormack correction for the dye: sharper filaments than plain semi-Lagrangian.
+const F_MACCORMACK = HEAD + `
+uniform sampler2D uVelocity, uPhiN, uPhiHatN1, uPhiHatN; uniform vec2 texelSize, dyeTexelSize; uniform float dt; uniform vec3 dissipation;
+void main(){
+  vec2 coord = vUv - dt * texture(uVelocity, vUv).xy * texelSize;
+  vec4 n1 = texture(uPhiHatN1, vUv), n0 = texture(uPhiHatN, vUv), phi = texture(uPhiN, vUv);
+  vec4 r = n1 + 0.5*(phi - n0);
+  vec2 st = coord/dyeTexelSize - .5; vec2 i = floor(st);
+  vec4 a = texture(uPhiN,(i+vec2(.5,.5))*dyeTexelSize), b = texture(uPhiN,(i+vec2(1.5,.5))*dyeTexelSize),
+       c = texture(uPhiN,(i+vec2(.5,1.5))*dyeTexelSize), d = texture(uPhiN,(i+vec2(1.5,1.5))*dyeTexelSize);
+  r = clamp(r, min(min(a,b),min(c,d)), max(max(a,b),max(c,d)));
+  // proportional decay + a small subtractive "evaporation" so thin smeared ink
+  // clears while dense cores persist (keeps the negative space clean)
+  frag = vec4(max(r.xyz / (1. + dt*dissipation) - dt*vec3(0.025, 0.05, 0.03), 0.), 1.);
+}`;
+
+const F_DIV = HEAD + `
+uniform sampler2D uVelocity;
+void main(){
+  float L = texture(uVelocity, vL).x, R = texture(uVelocity, vR).x, T = texture(uVelocity, vT).y, B = texture(uVelocity, vB).y;
+  vec2 C = texture(uVelocity, vUv).xy;
+  if (vL.x < 0.) L = -C.x; if (vR.x > 1.) R = -C.x; if (vT.y > 1.) T = -C.y; if (vB.y < 0.) B = -C.y;
+  frag = vec4(.5*(R-L+T-B), 0., 0., 1.);
+}`;
+const F_CURL = HEAD + `
+uniform sampler2D uVelocity;
+void main(){
+  float L = texture(uVelocity, vL).y, R = texture(uVelocity, vR).y, T = texture(uVelocity, vT).x, B = texture(uVelocity, vB).x;
+  frag = vec4(R - L - T + B, 0., 0., 1.);
+}`;
+const F_VORT = HEAD + `
+uniform sampler2D uVelocity, uCurl; uniform float curl, dt;
+void main(){
+  float L = texture(uCurl, vL).x, R = texture(uCurl, vR).x, T = texture(uCurl, vT).x, B = texture(uCurl, vB).x, C = texture(uCurl, vUv).x;
+  vec2 force = .5*vec2(abs(T)-abs(B), abs(R)-abs(L));
+  force /= length(force) + 1e-4; force *= curl * C; force.y *= -1.;
+  frag = vec4(clamp(texture(uVelocity, vUv).xy + force*dt, -600., 600.), 0., 1.);
+}`;
+const F_PRESS = HEAD + `
+uniform sampler2D uPressure, uDivergence;
+void main(){
+  float L = texture(uPressure, vL).x, R = texture(uPressure, vR).x, T = texture(uPressure, vT).x, B = texture(uPressure, vB).x;
+  frag = vec4((L+R+B+T - texture(uDivergence, vUv).x)*.25, 0., 0., 1.);
+}`;
+const F_GRAD = HEAD + `
+uniform sampler2D uPressure, uVelocity;
+void main(){
+  float L = texture(uPressure, vL).x, R = texture(uPressure, vR).x, T = texture(uPressure, vT).x, B = texture(uPressure, vB).x;
+  frag = vec4(texture(uVelocity, vUv).xy - vec2(R-L, T-B), 0., 1.);
+}`;
+
+const F_DISPLAY = HEAD + `
+uniform sampler2D uDye; uniform vec2 texelSize; uniform float time;
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+void main(){
+  vec4 d = texture(uDye, vUv);
+  float dense = d.r, veil = d.g, grain = d.b;
+  float gx = texture(uDye, vR).r - texture(uDye, vL).r, gy = texture(uDye, vT).r - texture(uDye, vB).r;
+  float edge = clamp(length(vec2(gx,gy))*2.2, 0., 1.);
+  float coreA = 1. - exp(-3.0*dense);
+  coreA = clamp(coreA + edge*0.3*smoothstep(0.02, 0.3, dense), 0., 1.);
+  float veilA = (1. - exp(-1.5*veil)) * 0.6;
+  float grainA = (1. - exp(-2.5*grain)) * 0.5;
+  vec3 ivory = vec3(0.949, 0.941, 0.914);
+  vec3 veilC = vec3(0.33, 0.325, 0.31);
+  vec3 coreC = mix(vec3(0.16, 0.155, 0.148), vec3(0.03), smoothstep(0.08, 1.1, dense));
+  vec3 c = ivory;
+  c = mix(c, veilC, veilA);
+  c = mix(c, coreC, coreA);
+  c = mix(c, vec3(0.05), grainA*0.85);
+  c += (hash(gl_FragCoord.xy + fract(time)*7.) - .5) * 0.016;      // paper grain
+  vec2 q = vUv - .5; c *= 1. - dot(q,q)*0.16;                       // vignette
+  frag = vec4(c, 1.);
+}`;
+
+// ── GL helpers ─────────────────────────────────────────────────────────────
+function compile(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const vert = compile(gl.VERTEX_SHADER, VERT);
+function program(fsrc, defines=''){
+  const p = gl.createProgram();
+  gl.attachShader(p, vert); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsrc.replace('#version 300 es\n', '#version 300 es\n' + defines)));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i=0;i<n;i++){ const name = gl.getActiveUniform(p,i).name; u[name] = gl.getUniformLocation(p,name); }
+  return { u, use(){ gl.useProgram(p); } };
+}
+let P;
+try {
+  const M = LINEAR_OK ? '' : '#define MANUAL\n';
+  P = { init: program(F_INIT), force: program(F_FORCE), splat: program(F_SPLAT), advect: program(F_ADVECT, M), mac: program(F_MACCORMACK),
+        div: program(F_DIV), curl: program(F_CURL), vort: program(F_VORT), press: program(F_PRESS), grad: program(F_GRAD), display: program(F_DISPLAY) };
+} catch (e) { console.error(e); return fallback('shader'); }
+gl.bindVertexArray(gl.createVertexArray());
+
+function createFBO(w, h, internal, format, filter){
+  const tex = gl.createTexture(); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, gl.HALF_FLOAT, null);
+  const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('FBO incomplete');
+  gl.viewport(0,0,w,h); gl.clearColor(0,0,0,1); gl.clear(gl.COLOR_BUFFER_BIT);
+  return { tex, fbo, w, h, texel:[1/w,1/h], attach(id){ gl.activeTexture(gl.TEXTURE0+id); gl.bindTexture(gl.TEXTURE_2D, tex); return id; }, dispose(){ gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); } };
+}
+function createDouble(w,h,i,f,filter){
+  let a = createFBO(w,h,i,f,filter), b = createFBO(w,h,i,f,filter);
+  return { w,h,texel:a.texel, get read(){return a;}, get write(){return b;}, swap(){ const t=a; a=b; b=t; }, dispose(){ a.dispose(); b.dispose(); } };
+}
+function draw(target){
+  if (target){ gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo); gl.viewport(0,0,target.w,target.h); }
+  else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0,0,gl.drawingBufferWidth,gl.drawingBufferHeight); }
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+let velocity, dye, dyeA, dyeB, pressure, divergence, curlT, simTime = 0;
+const aspect = () => canvas.width / canvas.height;
+function resolution(res){
+  const ar = aspect();
+  return ar > 1 ? { w: Math.round(res*ar), h: res } : { w: res, h: Math.round(res/ar) };
+}
+function initFBOs(){
+  const s = resolution(CONFIG.simRes), d = resolution(Math.min(CONFIG.dyeRes, canvas.height));
+  if (velocity) [velocity,dye,dyeA,dyeB,pressure,divergence,curlT].forEach(x => x.dispose());
+  velocity = createDouble(s.w,s.h,gl.RG16F,gl.RG,FILTER);
+  dye = createDouble(d.w,d.h,gl.RGBA16F,gl.RGBA,FILTER);
+  dyeA = createFBO(d.w,d.h,gl.RGBA16F,gl.RGBA,FILTER);
+  dyeB = createFBO(d.w,d.h,gl.RGBA16F,gl.RGBA,FILTER);
+  pressure = createDouble(s.w,s.h,gl.R16F,gl.RED,gl.NEAREST);
+  divergence = createFBO(s.w,s.h,gl.R16F,gl.RED,gl.NEAREST);
+  curlT = createFBO(s.w,s.h,gl.R16F,gl.RED,gl.NEAREST);
+  seedFields();
+}
+function seedFields(){
+  const p = P.init; p.use();
+  gl.uniform1f(p.u.seed, CONFIG.seed * 1.7); gl.uniform1f(p.u.aspect, aspect());
+  gl.uniform1i(p.u.mode, 0); gl.uniform2f(p.u.texelSize, dye.texel[0], dye.texel[1]); draw(dye.write); dye.swap();
+  gl.uniform1i(p.u.mode, 1); gl.uniform2f(p.u.texelSize, velocity.texel[0], velocity.texel[1]); draw(velocity.write); velocity.swap();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, pressure.read.fbo); gl.clear(gl.COLOR_BUFFER_BIT);
+  simTime = 0;
+}
+function resize(){
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  const w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; initFBOs(); }
+}
+const isMobile = /Mobi|Android/i.test(navigator.userAgent) || innerWidth < 700;
+if (isMobile){ CONFIG.simRes = 192; CONFIG.dyeRes = 720; CONFIG.pressureIters = 20; }
+resize();
+
+// ── Simulation ─────────────────────────────────────────────────────────────
+function splat(x, y, dx, dy, inkDense, inkVeil, radius){
+  const p = P.splat; p.use();
+  gl.uniform1f(p.u.aspect, aspect()); gl.uniform2f(p.u.point, x, y);
+  gl.uniform2f(p.u.texelSize, velocity.texel[0], velocity.texel[1]);
+  gl.uniform1i(p.u.uTarget, velocity.read.attach(0)); gl.uniform3f(p.u.color, dx, dy, 0); gl.uniform1f(p.u.radius, radius);
+  draw(velocity.write); velocity.swap();
+  if (inkDense > 0 || inkVeil > 0){
+    gl.uniform2f(p.u.texelSize, dye.texel[0], dye.texel[1]);
+    gl.uniform1i(p.u.uTarget, dye.read.attach(0)); gl.uniform3f(p.u.color, inkDense, 0, 0); gl.uniform1f(p.u.radius, radius);
+    draw(dye.write); dye.swap();
+    gl.uniform1i(p.u.uTarget, dye.read.attach(0)); gl.uniform3f(p.u.color, 0, inkVeil, 0); gl.uniform1f(p.u.radius, radius*3.0);
+    draw(dye.write); dye.swap();
+  }
+}
+function bandY(x){ const s = CONFIG.seed*1.7; return 0.50 + 0.075*Math.sin(x*5.3 + s) + 0.04*Math.sin(x*11.7 + s*2.3) + 0.03*Math.sin(x*2.1 - s); }
+function step(dt){
+  const tx = velocity.texel; let p;
+  // 1. forcing
+  p = P.force; p.use();
+  gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform1i(p.u.uVelocity, velocity.read.attach(0)); gl.uniform1i(p.u.uDye, dye.read.attach(1));
+  gl.uniform1f(p.u.dt, dt); gl.uniform1f(p.u.time, simTime); gl.uniform1f(p.u.seed, CONFIG.seed*1.7); gl.uniform1f(p.u.aspect, aspect());
+  gl.uniform1f(p.u.amp, CONFIG.forceAmp); gl.uniform1f(p.u.drift, CONFIG.drift);
+  draw(velocity.write); velocity.swap();
+  // slow feed from the right edge so the composition keeps gaining ink, as in the reference
+  const ys = bandY(0.99) + Math.sin(simTime*0.6)*0.02;
+  splat(0.995, ys, -0.12, Math.sin(simTime*0.9)*0.03, 0.05*dt, 0.03*dt, 0.0012);
+  // 2. vorticity confinement
+  p = P.curl; p.use(); gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform1i(p.u.uVelocity, velocity.read.attach(0)); draw(curlT);
+  p = P.vort; p.use(); gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform1i(p.u.uVelocity, velocity.read.attach(0)); gl.uniform1i(p.u.uCurl, curlT.attach(1));
+  gl.uniform1f(p.u.curl, CONFIG.curl); gl.uniform1f(p.u.dt, dt); draw(velocity.write); velocity.swap();
+  // 3. projection
+  p = P.div; p.use(); gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform1i(p.u.uVelocity, velocity.read.attach(0)); draw(divergence);
+  p = P.press; p.use(); gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform1i(p.u.uDivergence, divergence.attach(0));
+  for (let i=0;i<CONFIG.pressureIters;i++){ gl.uniform1i(p.u.uPressure, pressure.read.attach(1)); draw(pressure.write); pressure.swap(); }
+  p = P.grad; p.use(); gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform1i(p.u.uPressure, pressure.read.attach(0)); gl.uniform1i(p.u.uVelocity, velocity.read.attach(1));
+  draw(velocity.write); velocity.swap();
+  // 4. advect velocity
+  p = P.advect; p.use();
+  gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform2f(p.u.srcTexelSize, tx[0], tx[1]);
+  const vid = velocity.read.attach(0); gl.uniform1i(p.u.uVelocity, vid); gl.uniform1i(p.u.uSource, vid);
+  gl.uniform1f(p.u.dt, dt); gl.uniform3f(p.u.dissipation, CONFIG.velDissipation, CONFIG.velDissipation, 0);
+  draw(velocity.write); velocity.swap();
+  // 5. advect dye (MacCormack): forward, backward, correct
+  gl.uniform2f(p.u.srcTexelSize, dye.texel[0], dye.texel[1]); gl.uniform3f(p.u.dissipation, 0, 0, 0);
+  gl.uniform1i(p.u.uVelocity, velocity.read.attach(0)); gl.uniform1i(p.u.uSource, dye.read.attach(1)); gl.uniform1f(p.u.dt, dt); draw(dyeA);
+  gl.uniform1i(p.u.uSource, dyeA.attach(1)); gl.uniform1f(p.u.dt, -dt); draw(dyeB);
+  p = P.mac; p.use();
+  gl.uniform2f(p.u.texelSize, tx[0], tx[1]); gl.uniform2f(p.u.dyeTexelSize, dye.texel[0], dye.texel[1]); gl.uniform1f(p.u.dt, dt);
+  gl.uniform3fv(p.u.dissipation, CONFIG.dyeDissipation);
+  gl.uniform1i(p.u.uVelocity, velocity.read.attach(0)); gl.uniform1i(p.u.uPhiN, dye.read.attach(1)); gl.uniform1i(p.u.uPhiHatN1, dyeA.attach(2)); gl.uniform1i(p.u.uPhiHatN, dyeB.attach(3));
+  draw(dye.write); dye.swap();
+  simTime += dt;
+}
+function render(t){
+  const p = P.display; p.use();
+  gl.uniform2f(p.u.texelSize, dye.texel[0], dye.texel[1]); gl.uniform1i(p.u.uDye, dye.read.attach(0)); gl.uniform1f(p.u.time, t);
+  draw(null);
+}
+
+// ── Pointer interaction ────────────────────────────────────────────────────
+const pointers = new Map();
+function ptrPos(e){ const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left)/r.width, y: 1 - (e.clientY - r.top)/r.height }; }
+canvas.addEventListener('pointerdown', e => { canvas.setPointerCapture(e.pointerId); const p = ptrPos(e); pointers.set(e.pointerId, { ...p, px:p.x, py:p.y, down:true, moved:false }); });
+canvas.addEventListener('pointermove', e => {
+  const p = ptrPos(e); let s = pointers.get(e.pointerId);
+  if (!s){ s = { ...p, px:p.x, py:p.y, down:false, moved:false }; pointers.set(e.pointerId, s); }
+  s.px = s.x; s.py = s.y; s.x = p.x; s.y = p.y; s.moved = true; s.down = s.down || (e.buttons & 1) === 1;
+});
+const endPtr = e => { const s = pointers.get(e.pointerId); if (s) s.down = false; if (e.pointerType !== 'mouse') pointers.delete(e.pointerId); };
+canvas.addEventListener('pointerup', endPtr); canvas.addEventListener('pointercancel', endPtr); canvas.addEventListener('pointerleave', e => pointers.delete(e.pointerId));
+function applyPointers(){
+  const ar = aspect();
+  for (const s of pointers.values()){
+    if (!s.moved) continue; s.moved = false;
+    let dx = (s.x - s.px)*ar, dy = (s.y - s.py);
+    const len = Math.hypot(dx, dy), max = 0.06; if (len > max){ dx *= max/len; dy *= max/len; }
+    const f = CONFIG.splatForce * (s.down ? 1 : 0.3), speed = Math.min(1, len/0.03);
+    const ink = s.down ? 0.02 + speed*0.05 : speed*0.006;
+    splat(s.x, s.y, dx*f, dy*f, ink, ink*0.8, CONFIG.splatRadius*(s.down ? 1.6 : 1));
+  }
+}
+
+// ── Main loop ──────────────────────────────────────────────────────────────
+let paused = reduced, last = performance.now(), hidden = false, stopped = false;
+document.addEventListener('visibilitychange', () => { hidden = document.hidden; last = performance.now(); });
+addEventListener('resize', resize);
+addEventListener('keydown', e => {
+  if (e.code === 'Space'){ e.preventDefault(); paused = !paused; }
+  if (e.key === 'r' || e.key === 'R') seedFields();
+});
+const FIXED = 1/60; let acc = 0;
+function frame(now){
+  if (stopped) return;
+  requestAnimationFrame(frame);
+  if (hidden) return;
+  const dt = Math.min((now - last)/1000, 1/20); last = now;
+  if (!paused){
+    acc += dt; let n = 0;
+    while (acc >= FIXED && n < 2){ applyPointers(); step(FIXED); acc -= FIXED; n++; }
+    if (n === 2) acc = 0;
+  } else { applyPointers(); step(FIXED*0.2); }
+  render(now/1000);
+}
+for (let i=0;i<70;i++) step(FIXED);     // pre-roll: curls already forming on first paint
+render(0);
+document.body.classList.add('ready');
+canvas.dataset.ready = '1';
+requestAnimationFrame(frame);
+// Deterministic stepping hook for screenshots / QA.
+window.__noir = { stop(){ stopped = true; }, advance(sec){ const n = Math.round(sec/FIXED); for (let i=0;i<n;i++){ applyPointers(); step(FIXED); } render(simTime); }, splat, reset: seedFields, config: CONFIG, get simTime(){ return simTime; } };
+
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); fallback('context-lost'); });
+function fallback(reason){
+  console.warn('NOIR FLOW fallback:', reason);
+  document.getElementById('fallback').style.display = 'block';
+  canvas.style.display = 'none';
+  document.body.classList.add('ready');
+}
+})();
+</script>
+</body>
+</html>
